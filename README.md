@@ -85,7 +85,7 @@ The script prints a line per site while it runs, then a summary table, and saves
 - **`NO` means "found nothing", not "not Java".** Only the start page and one error page are checked. A reverse proxy or CDN often hides the `Server` header. Many Java apps set no `JSESSIONID` until you log in, or use another cookie name.
 - **`ERROR` rows were not scanned.** Re-run them and read the `Notes` column.
 - **TLS certificates are not verified** (`curl -k` / a certificate callback that always accepts). That is convenient for scanning sites with broken certificates, but the result could be spoofed by someone in the network path.
-- **Sequential and slow for big lists.** Each site takes up to two timeouts (`-TimeoutSec`, default 12 s) per request.
+- **Sequential and slow for big lists.** Each site needs two requests, each with a timeout of `-TimeoutSec` seconds (default 12).
 - The browser-like `User-Agent` is only there so that simple bot filters do not block the request.
 - The `curl` path is the one to trust. The .NET fallback (used when no `curl` is found) is less tested.
 
