@@ -25,6 +25,14 @@
 .PARAMETER TimeoutSec
     Timeout per request in seconds (default 12).
 
+.PARAMETER StrictTls
+    Never fall back to an unverified TLS connection. By default a site whose certificate cannot be
+    verified (expired, self-signed, TLS-inspection proxy, ...) is scanned anyway and marked
+    TlsVerified = False with a note; with -StrictTls such a site is reported as ERROR instead.
+
+.PARAMETER PassThru
+    Also write the result objects to the pipeline (for example to filter them or export them yourself).
+
 .EXAMPLE
     .\Test-WebsiteJavaBackend.ps1 -Url example.com
 
@@ -47,7 +55,13 @@ param (
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 300)]
-    [int]$TimeoutSec = 12
+    [int]$TimeoutSec = 12,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$StrictTls,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$PassThru
 )
 
 begin {
@@ -61,6 +75,31 @@ begin {
     $curlCmd = Get-Command -CommandType Application -Name 'curl.exe', 'curl' -ErrorAction SilentlyContinue | Select-Object -First 1
     $curlPath = if ($curlCmd) { $curlCmd.Source } else { $null }
 
+    # Max. number of body characters that are searched (curl still downloads the whole page; only the search is capped).
+    $maxBodyChars = 2MB
+
+    # curl exit codes that mean "TLS handshake / certificate problem" (not a dead host)
+    $tlsCurlCodes = @(35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91)
+
+    # Certificate callback for the .NET fallback. A compiled callback is used because a PowerShell script block
+    # is not reliable as a certificate callback (it runs on another thread without a runspace).
+    $trustAllReady = $false
+    try {
+        if (-not ('JavaScanTrustAll' -as [type])) {
+            Add-Type -TypeDefinition @'
+public static class JavaScanTrustAll
+{
+    public static bool Accept(object sender, System.Security.Cryptography.X509Certificates.X509Certificate cert,
+        System.Security.Cryptography.X509Certificates.X509Chain chain, System.Net.Security.SslPolicyErrors errors)
+    { return true; }
+    public static System.Net.Security.RemoteCertificateValidationCallback Handler =
+        new System.Net.Security.RemoteCertificateValidationCallback(Accept);
+}
+'@ -ErrorAction Stop
+        }
+        $trustAllReady = $true
+    } catch { $trustAllReady = $false }
+
     function Format-TargetUrl {
         param([string]$Raw)
         $clean = $Raw.Trim()
@@ -72,6 +111,8 @@ begin {
     function Get-CurlError {
         param([int]$ExitCode)
         switch ($ExitCode) {
+            1       { return "unsupported protocol" }
+            3       { return "malformed URL" }
             6       { return "DNS lookup failed" }
             7       { return "connection refused" }
             28      { return "timed out" }
@@ -80,7 +121,10 @@ begin {
             52      { return "empty reply from server" }
             56      { return "connection reset" }
             60      { return "TLS certificate problem" }
-            default { return "curl exit code $ExitCode" }
+            default {
+                if ($tlsCurlCodes -contains $ExitCode) { return "TLS problem (curl exit code $ExitCode)" }
+                return "curl exit code $ExitCode"
+            }
         }
     }
 
@@ -91,7 +135,8 @@ begin {
             [int]$StatusCode = 0,
             [string]$FinalHeaders = "",
             [string]$AllHeaders = "",
-            [string]$Body = ""
+            [string]$Body = "",
+            [bool]$TlsFailure = $false
         )
         [PSCustomObject]@{
             Ok           = $Ok
@@ -100,21 +145,45 @@ begin {
             FinalHeaders = $FinalHeaders   # headers of the last response in the redirect chain
             AllHeaders   = $AllHeaders     # headers of every response in the chain (cookies set on redirects count)
             Body         = $Body
+            TlsFailure   = $TlsFailure     # failed because of TLS / certificate (retry without verification is possible)
+            Insecure     = $false          # set to $true when the answer came from an unverified TLS connection
         }
+    }
+
+    # Read at most $maxBodyChars characters of a file (keeps memory use small for very large pages).
+    function Read-CappedFile {
+        param([string]$FilePath)
+        $fs = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+            $buf = New-Object char[] 65536
+            $sb = New-Object System.Text.StringBuilder
+            while ($sb.Length -lt $maxBodyChars) {
+                $n = $sr.Read($buf, 0, $buf.Length)
+                if ($n -le 0) { break }
+                [void]$sb.Append($buf, 0, $n)
+            }
+            return $sb.ToString()
+        } finally { $fs.Dispose() }
     }
 
     # Fetch one URL. Never throws; a failed request returns Ok = $false with an error text.
     function Invoke-FastRequest {
-        param([string]$TargetUrl)
+        param([string]$TargetUrl, [switch]$Insecure)
 
         if ($curlPath) {
             $hdrFile = [System.IO.Path]::GetTempFileName()
             $bodyFile = [System.IO.Path]::GetTempFileName()
             try {
-                $code = & $curlPath -s -k -L --max-redirs 10 -m $TimeoutSec -A $userAgent -H "Accept: $acceptHeader" -D $hdrFile -o $bodyFile -w '%{http_code}' $TargetUrl
+                # --ssl-no-revoke: Windows (Schannel) otherwise fails when the CRL/OCSP servers are not reachable
+                $curlArgs = @('-s', '-L', '--max-redirs', '10', '-m', $TimeoutSec, '--ssl-no-revoke',
+                              '-A', $userAgent, '-H', "Accept: $acceptHeader", '-D', $hdrFile, '-o', $bodyFile, '-w', '%{http_code}')
+                if ($Insecure) { $curlArgs += '-k' }
+                $curlArgs += $TargetUrl
+                $code = & $curlPath @curlArgs
                 $exit = $LASTEXITCODE
                 if ($exit -ne 0) {
-                    return New-FetchResult -Ok $false -ErrorText (Get-CurlError $exit)
+                    return New-FetchResult -Ok $false -ErrorText (Get-CurlError $exit) -TlsFailure ($tlsCurlCodes -contains $exit)
                 }
 
                 $status = 0
@@ -127,7 +196,7 @@ begin {
                     return New-FetchResult -Ok $false -ErrorText "no HTTP response received"
                 }
 
-                $body = [System.IO.File]::ReadAllText($bodyFile)
+                $body = Read-CappedFile $bodyFile
                 return New-FetchResult -Ok $true -StatusCode $status -FinalHeaders $blocks[-1] -AllHeaders ($blocks -join "`n") -Body $body
             } catch {
                 return New-FetchResult -Ok $false -ErrorText $_.Exception.Message
@@ -142,7 +211,12 @@ begin {
         $resp = $null
         try {
             [System.Net.ServicePointManager]::SecurityProtocol = $oldProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+            if ($Insecure) {
+                if ($trustAllReady) { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [JavaScanTrustAll]::Handler }
+                else { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
+            } else {
+                [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+            }
 
             $jar = New-Object System.Net.CookieContainer
             $req = [System.Net.HttpWebRequest]::Create($TargetUrl)
@@ -160,7 +234,12 @@ begin {
             } catch [System.Net.WebException] {
                 # 4xx/5xx still carry headers and a body, so keep that response.
                 if ($_.Exception.Response) { $resp = $_.Exception.Response }
-                else { return New-FetchResult -Ok $false -ErrorText $_.Exception.Message }
+                else {
+                    $we = $_.Exception
+                    $isTls = ($we.Status -in @([System.Net.WebExceptionStatus]::TrustFailure, [System.Net.WebExceptionStatus]::SecureChannelFailure)) -or
+                             ($we.ToString() -match '(?i)SSL|TLS|certificate|trust')
+                    return New-FetchResult -Ok $false -ErrorText $we.Message -TlsFailure $isTls
+                }
             }
 
             $headers = New-Object System.Text.StringBuilder
@@ -176,17 +255,52 @@ begin {
             }
 
             $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-            try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            try {
+                $buf = New-Object char[] 65536
+                $sb = New-Object System.Text.StringBuilder
+                while ($sb.Length -lt $maxBodyChars) {
+                    $n = $reader.Read($buf, 0, $buf.Length)
+                    if ($n -le 0) { break }
+                    [void]$sb.Append($buf, 0, $n)
+                }
+                $body = $sb.ToString()
+            } finally { $reader.Dispose() }
 
             $text = $headers.ToString()
             return New-FetchResult -Ok $true -StatusCode ([int]$resp.StatusCode) -FinalHeaders $text -AllHeaders $text -Body $body
         } catch {
-            return New-FetchResult -Ok $false -ErrorText $_.Exception.Message
+            $isTls = ($_.Exception.ToString() -match '(?i)SSL|TLS|certificate|trust')
+            return New-FetchResult -Ok $false -ErrorText $_.Exception.Message -TlsFailure $isTls
         } finally {
             if ($resp) { $resp.Close() }
             [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
             [System.Net.ServicePointManager]::SecurityProtocol = $oldProtocol
         }
+    }
+
+    # Verified TLS first; if that fails because of the certificate/handshake, retry once without verification
+    # (unless -StrictTls). The result says whether the unverified connection was needed.
+    function Invoke-ScanRequest {
+        param([string]$TargetUrl, [switch]$ForceInsecure)
+        if ($ForceInsecure) {
+            $r = Invoke-FastRequest -TargetUrl $TargetUrl -Insecure
+            $r.Insecure = $true
+            return $r
+        }
+        $r = Invoke-FastRequest -TargetUrl $TargetUrl
+        if (-not $r.Ok -and $r.TlsFailure -and -not $StrictTls) {
+            $first = $r.Error
+            $r = Invoke-FastRequest -TargetUrl $TargetUrl -Insecure
+            if ($r.Ok) { $r.Insecure = $true; $r | Add-Member -NotePropertyName FirstTlsError -NotePropertyValue $first }
+        }
+        return $r
+    }
+
+    function Test-ValidTargetUrl {
+        param([string]$Candidate)
+        $u = $null
+        return ([System.Uri]::TryCreate($Candidate, [System.UriKind]::Absolute, [ref]$u) -and
+                ($u.Scheme -eq 'http' -or $u.Scheme -eq 'https') -and $u.Host)
     }
 
     # Random non-existent path below the target path; query string and fragment are dropped.
@@ -235,7 +349,14 @@ end {
         return
     }
 
-    Write-Host "Loaded $($targetUrls.Count) URL(s) to scan.`n" -ForegroundColor Cyan
+    # Remove duplicates (same URL, ignoring case), keep the order.
+    $seenUrls = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $uniqueUrls = [System.Collections.Generic.List[string]]::new()
+    foreach ($t in $targetUrls) { if ($seenUrls.Add($t)) { $uniqueUrls.Add($t) } }
+    $dupeCount = $targetUrls.Count - $uniqueUrls.Count
+    $targetUrls = $uniqueUrls
+
+    Write-Host "Loaded $($targetUrls.Count) URL(s) to scan.$(if ($dupeCount -gt 0) { " ($dupeCount duplicate(s) skipped)" })`n" -ForegroundColor Cyan
     if (-not $curlPath) {
         Write-Host "curl not found: using the .NET HTTP fallback." -ForegroundColor DarkYellow
     }
@@ -260,15 +381,28 @@ end {
         $serverBanner = "N/A"
         $httpStatus = ""
         $failed = $false
+        $tlsVerified = ""
 
         try {
-            $main = Invoke-FastRequest -TargetUrl $target
+            if (-not (Test-ValidTargetUrl $target)) {
+                $failed = $true
+                $notes.Add("Invalid URL (needs a host name and http or https)")
+                $main = $null
+            } else {
+                $main = Invoke-ScanRequest -TargetUrl $target
+            }
 
-            if (-not $main.Ok) {
+            if ($failed) {
+                # already explained in Notes
+            } elseif (-not $main.Ok) {
                 $failed = $true
                 $notes.Add("Request failed: $($main.Error)")
             } else {
                 $httpStatus = $main.StatusCode
+                $tlsVerified = if ($target -like 'https://*') { -not $main.Insecure } else { "" }
+                if ($main.Insecure) {
+                    $notes.Add("TLS certificate NOT verified ($($main.FirstTlsError)); the answer could come from a proxy in the path")
+                }
 
                 # Headers: the final response decides; cookies set on any hop of a redirect chain count.
                 $finalHeaders = $main.FinalHeaders
@@ -279,7 +413,7 @@ end {
                 } elseif ($allHeaders -match '(?im)^Server:\s*(.*)') {
                     $serverBanner = $matches[1].Trim()
                 }
-                if ($serverBanner -match '(?i)Tomcat|Jetty|JBoss|WildFly|GlassFish|WebLogic|WebSphere|Apache-Coyote|Undertow') {
+                if ($serverBanner -match '(?i)Tomcat|Jetty|JBoss|WildFly|GlassFish|WebLogic|WebSphere|Apache-Coyote|Undertow|Payara|Resin|Grizzly') {
                     Add-Evidence $evidence "Server: $serverBanner" 3
                 }
 
@@ -294,6 +428,20 @@ end {
                     Add-Evidence $evidence "Cookie: $($matches[1])" 3
                 }
 
+                # Spring Boot 1.x sends this header; Liferay announces itself; a session id inside a link or redirect
+                # (URL rewriting, ";jsessionid=") is a servlet container feature.
+                if ($finalHeaders -match '(?im)^X-Application-Context:\s*(.*)') {
+                    Add-Evidence $evidence "X-Application-Context: $($matches[1].Trim())" 3
+                }
+                if ($finalHeaders -match '(?im)^Liferay-Portal:\s*(.*)') {
+                    Add-Evidence $evidence "Liferay-Portal: $($matches[1].Trim())" 3
+                }
+                if ($allHeaders -match '(?im)^Location:.*;jsessionid=') {
+                    Add-Evidence $evidence "Redirect with ;jsessionid= in the URL" 3
+                } elseif ($main.Body -match '(?i);jsessionid=[0-9A-Za-z\-\._]+') {
+                    Add-Evidence $evidence "HTML: link with ;jsessionid= session id" 3
+                }
+
                 foreach ($pat in $javaPatterns) {
                     if ($main.Body -match $pat.Regex) {
                         $hit = $matches[0]
@@ -305,7 +453,7 @@ end {
                 # 404 probe: only a real error response (HTTP >= 400) counts. A site that answers every
                 # unknown path with its normal page (soft 404) would otherwise produce false positives.
                 try {
-                    $probe = Invoke-FastRequest -TargetUrl (New-ProbeUrl -Target $target)
+                    $probe = Invoke-ScanRequest -TargetUrl (New-ProbeUrl -Target $target) -ForceInsecure:$main.Insecure
                     if (-not $probe.Ok) {
                         $notes.Add("404 probe failed: $($probe.Error); error-page checks skipped")
                     } elseif ($probe.StatusCode -lt 400) {
@@ -378,6 +526,7 @@ end {
             JavaDetected = $verdict
             Confidence   = $confidence
             HttpStatus   = $httpStatus
+            TlsVerified  = $tlsVerified
             ServerHeader = $serverBanner
             Evidence     = $evidenceText
             Notes        = $notesText
@@ -386,11 +535,13 @@ end {
 
     # Final Table Output
     Write-Host "`n=================== SCAN SUMMARY ===================" -ForegroundColor Cyan
-    $summaryList | Format-Table -Wrap -Property URL, JavaDetected, Confidence, HttpStatus, ServerHeader, Evidence, Notes
+    $summaryList | Format-Table -Wrap -Property URL, JavaDetected, Confidence, HttpStatus, TlsVerified, ServerHeader, Evidence, Notes | Out-Host
 
     # Export to CSV
     if ($CsvReport) {
         $summaryList | Export-Csv -Path $CsvReport -NoTypeInformation -Encoding UTF8
         Write-Host "`nDetailed report saved to: $CsvReport" -ForegroundColor Cyan
     }
+
+    if ($PassThru) { $summaryList }
 }
